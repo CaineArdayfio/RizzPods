@@ -1,0 +1,24 @@
+# Xcode scheme files that may contain sensitive data like API keys
+VoiceModeWebRTCSwift.xcodeproj/xcshareddata/xcschemes/VoiceModeWebRTCSwift.xcscheme
+
+# General Xcode files to ignore
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+.DS_Store
+
+# Build artifacts
+build/
+DerivedData/
+
+# Swift Package Manager
+.swiftpm/
+Packages/
+Package.resolved
+
+# CocoaPods (if using)
+Pods/
+Podfile.lock
+
+# Carthage (if using)
+Carthage/Build/
+Carthage/Checkouts/ 

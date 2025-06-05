@@ -68,11 +68,13 @@ struct ContentView: View {
             // Set up the callback to reset path options when user transcript is completed
             webrtcManager.onUserTranscriptCompleted = {
                 // Do exactly what the "Reset Path Options" button does
-                print("=== CONVERSATION TRANSCRIPT (AUTO-TRIGGERED) ===")
-                for (index, item) in webrtcManager.conversation.enumerated() {
-                    print("[\(index + 1)] \(item.role.uppercased()): \(item.text.trimmingCharacters(in: .whitespacesAndNewlines))")
+                if Config.DEBUG {
+                    print("=== CONVERSATION TRANSCRIPT (AUTO-TRIGGERED) ===")
+                    for (index, item) in webrtcManager.conversation.enumerated() {
+                        print("[\(index + 1)] \(item.role.uppercased()): \(item.text.trimmingCharacters(in: .whitespacesAndNewlines))")
+                    }
+                    print("=== END TRANSCRIPT ===")
                 }
-                print("=== END TRANSCRIPT ===")
 
                 // Analyze conversation and suggest next moves
                 analyzeConversationPaths()

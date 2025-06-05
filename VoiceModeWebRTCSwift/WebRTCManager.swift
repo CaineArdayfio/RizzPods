@@ -1,4 +1,5 @@
 import WebRTC
+import AVFoundation
 
 extension Double {
     func rounded(toPlaces places: Int) -> Double {
@@ -9,6 +10,7 @@ extension Double {
 
 // MARK: - WebRTCManager
 class WebRTCManager: NSObject, ObservableObject {
+    
     // UI State
     @Published var connectionStatus: ConnectionStatus = .disconnected
     @Published var eventTypeStr: String = ""
@@ -32,6 +34,11 @@ class WebRTCManager: NSObject, ObservableObject {
     private var peerConnection: RTCPeerConnection?
     private var dataChannel: RTCDataChannel?
     private var audioTrack: RTCAudioTrack?
+    private var remoteAudioTrack: RTCAudioTrack?
+    
+    // Audio routing state
+    private var originalVolume: Float = 0.5
+    private var isInPrivateMode: Bool = false
     
     // MARK: - Public Methods
     
@@ -99,6 +106,8 @@ class WebRTCManager: NSObject, ObservableObject {
                                     self.connectionStatus = .disconnected
                                 } else {
                                     self.connectionStatus = .connected
+                                    // Initialize in normal mode (phone mic, muted output)
+                                    self.switchToNormalMode()
                                 }
                             }
                         }
@@ -116,7 +125,17 @@ class WebRTCManager: NSObject, ObservableObject {
         peerConnection = nil
         dataChannel = nil
         audioTrack = nil
+        remoteAudioTrack = nil
         connectionStatus = .disconnected
+        isInPrivateMode = false
+        
+        // Reset audio session to default state
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.overrideOutputAudioPort(.none)
+        } catch {
+            print("Failed to reset audio session: \(error)")
+        }
     }
     
     /// Sends a predefined context message to the model
@@ -157,23 +176,127 @@ class WebRTCManager: NSObject, ObservableObject {
         }
     }
     
-    /// Mutes the local audio track
+    /// Mutes the local audio track and switches to private mode
     func mute() {
         audioTrack?.isEnabled = false
         isMuted = true
+        switchToPrivateMode()
     }
     
-    /// Unmutes the local audio track
+    /// Unmutes the local audio track and switches to normal mode
     func unmute() {
         audioTrack?.isEnabled = true
         isMuted = false
+        switchToNormalMode()
+    }
+    
+    /// Switch to private mode: headphones input/output, WebRTC muted
+    private func switchToPrivateMode() {
+        guard !isInPrivateMode else { return }
+        isInPrivateMode = true
+        
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            
+            // Try to route to Bluetooth headphones if available
+            if let bluetoothInput = findBluetoothInput() {
+                try audioSession.setPreferredInput(bluetoothInput)
+                if Config.DEBUG {
+                    print("✅ Switched to private mode: Using Bluetooth headphones")
+                }
+                // For Bluetooth, also ensure output goes to the same device
+                try audioSession.overrideOutputAudioPort(.none) // Clear any override to use default routing
+            } else {
+                if Config.DEBUG {
+                    print("ℹ️ No Bluetooth found, using built-in devices for private mode")
+                }
+                // Use built-in speaker for output in private mode
+                try audioSession.overrideOutputAudioPort(.speaker)
+            }
+            
+            // Enable remote audio playback (user can hear assistant)
+            enableRemoteAudio()
+            
+        } catch {
+            if Config.DEBUG {
+                print("Failed to switch to private mode: \(error)")
+            }
+        }
+    }
+    
+    /// Switch to normal mode: phone mic input, muted output
+    private func switchToNormalMode() {
+        isInPrivateMode = false
+        
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            
+            // Route back to built-in microphone
+            if let builtInMic = findBuiltInMicrophone() {
+                try audioSession.setPreferredInput(builtInMic)
+                if Config.DEBUG {
+                    print("✅ Switched to normal mode: Using built-in microphone")
+                }
+            }
+            
+            // Disable remote audio playback (phone stays silent)
+            disableRemoteAudio()
+            
+        } catch {
+            if Config.DEBUG {
+                print("Failed to switch to normal mode: \(error)")
+            }
+        }
+    }
+    
+    /// Enable remote audio track (user can hear assistant)
+    private func enableRemoteAudio() {
+        guard let peerConnection = peerConnection else { return }
+        
+        // Find and enable remote audio tracks
+        for transceiver in peerConnection.transceivers {
+            if let track = transceiver.receiver.track as? RTCAudioTrack {
+                track.isEnabled = true
+                remoteAudioTrack = track
+                if Config.DEBUG {
+                    print("✅ Enabled remote audio track")
+                }
+                break
+            }
+        }
+    }
+    
+    /// Disable remote audio track (phone stays silent)
+    private func disableRemoteAudio() {
+        remoteAudioTrack?.isEnabled = false
+        if Config.DEBUG {
+            print("✅ Disabled remote audio track (phone muted)")
+        }
+    }
+    
+    /// Find Bluetooth input device
+    private func findBluetoothInput() -> AVAudioSessionPortDescription? {
+        let audioSession = AVAudioSession.sharedInstance()
+        return audioSession.availableInputs?.first { input in
+            input.portType == .bluetoothHFP || input.portType == .bluetoothA2DP
+        }
+    }
+    
+    /// Find built-in microphone
+    private func findBuiltInMicrophone() -> AVAudioSessionPortDescription? {
+        let audioSession = AVAudioSession.sharedInstance()
+        return audioSession.availableInputs?.first { input in
+            input.portType == .builtInMic
+        }
     }
     
     /// Called automatically when data channel opens, or you can manually call it.
     /// Updates session configuration with the latest instructions and voice.
     func sendSessionUpdate() {
         guard let dc = dataChannel, dc.readyState == .open else {
-            print("Data channel is not open. Cannot send session.update.")
+            if Config.DEBUG {
+                print("Data channel is not open. Cannot send session.update.")
+            }
             return
         }
         
@@ -190,9 +313,9 @@ class WebRTCManager: NSObject, ObservableObject {
                 ],
                 "turn_detection": [
                     "type": "server_vad",
-                    "threshold": Decimal(string: "0.5")!,
+                    "threshold": Decimal(string: "0.4")!,
                     "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500,
+                    "silence_duration_ms": 400,
                     "create_response": true
                 ],
                 "max_response_output_tokens": "inf"
@@ -203,9 +326,13 @@ class WebRTCManager: NSObject, ObservableObject {
             let jsonData = try JSONSerialization.data(withJSONObject: sessionUpdate)
             let buffer = RTCDataBuffer(data: jsonData, isBinary: false)
             dc.sendData(buffer)
-            print("session.update event sent.")
+            if Config.DEBUG {
+                print("session.update event sent.")
+            }
         } catch {
-            print("Failed to serialize session.update JSON: \(error)")
+            if Config.DEBUG {
+                print("Failed to serialize session.update JSON: \(error)")
+            }
         }
     }
     
@@ -223,11 +350,109 @@ class WebRTCManager: NSObject, ObservableObject {
         do {
             let audioSession = AVAudioSession.sharedInstance()
             try audioSession.setCategory(.playAndRecord, options: [.defaultToSpeaker, .allowBluetooth])
-            try audioSession.setMode(.default)
+            try audioSession.setMode(.voiceChat) // Optimized for voice chat, enables Bluetooth
             try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+            
+            // Print current route information
+            if Config.DEBUG {
+                printCurrentAudioRoute()
+            }
+            
         } catch {
-            print("Failed to configure AVAudioSession: \(error)")
+            if Config.DEBUG {
+                print("Failed to configure AVAudioSession: \(error)")
+            }
         }
+    }
+    
+    private func printCurrentAudioRoute() {
+        guard Config.DEBUG else { return }
+        
+        let audioSession = AVAudioSession.sharedInstance()
+        let currentRoute = audioSession.currentRoute
+        
+        print("🎵 Current Audio Route Information:")
+        print("═══════════════════════════════════")
+        
+        // Print input ports
+        print("📥 Input Ports (\(currentRoute.inputs.count)):")
+        for (index, input) in currentRoute.inputs.enumerated() {
+            print("  Input \(index + 1):")
+            printPortDescription(input, prefix: "    ")
+        }
+        
+        // Print output ports
+        print("📤 Output Ports (\(currentRoute.outputs.count)):")
+        for (index, output) in currentRoute.outputs.enumerated() {
+            print("  Output \(index + 1):")
+            printPortDescription(output, prefix: "    ")
+        }
+        
+        // Print available inputs
+        if let availableInputs = audioSession.availableInputs {
+            print("🔍 Available Inputs (\(availableInputs.count)):")
+            for (index, input) in availableInputs.enumerated() {
+                print("  Available Input \(index + 1):")
+                printPortDescription(input, prefix: "    ")
+            }
+        } else {
+            print("🔍 Available Inputs: None")
+        }
+        
+        // Print preferred input
+        if let preferredInput = audioSession.preferredInput {
+            print("⭐ Preferred Input:")
+            printPortDescription(preferredInput, prefix: "  ")
+        } else {
+            print("⭐ Preferred Input: None")
+        }
+        
+        print("═══════════════════════════════════")
+    }
+    
+    private func printPortDescription(_ port: AVAudioSessionPortDescription, prefix: String = "") {
+        print("\(prefix)Port Name: \(port.portName)")
+        print("\(prefix)Port Type: \(port.portType.rawValue)")
+        print("\(prefix)UID: \(port.uid)")
+        print("\(prefix)Has Hardware Voice Call Processing: \(port.hasHardwareVoiceCallProcessing)")
+        print("\(prefix)Supports Spatial Audio: \(port.isSpatialAudioEnabled)")
+        print("\(prefix)Channels: \(port.channels?.count ?? 0)")
+        
+        // Print channel information
+        if let channels = port.channels {
+            for (index, channel) in channels.enumerated() {
+                print("\(prefix)  Channel \(index + 1): \(channel.channelName) (Number: \(channel.channelNumber))")
+            }
+        }
+        
+        // Print data sources if available
+        if let dataSources = port.dataSources {
+            print("\(prefix)Data Sources (\(dataSources.count)):")
+            for (index, dataSource) in dataSources.enumerated() {
+                print("\(prefix)  Data Source \(index + 1):")
+                print("\(prefix)    Name: \(dataSource.dataSourceName)")
+                print("\(prefix)    ID: \(dataSource.dataSourceID)")
+                if let location = dataSource.location {
+                    print("\(prefix)    Location: \(location.rawValue)")
+                }
+                if let orientation = dataSource.orientation {
+                    print("\(prefix)    Orientation: \(orientation.rawValue)")
+                }
+                if let supportedPolarPatterns = dataSource.supportedPolarPatterns {
+                    print("\(prefix)    Supported Polar Patterns: \(supportedPolarPatterns.map { $0.rawValue })")
+                }
+                if let selectedPolarPattern = dataSource.selectedPolarPattern {
+                    print("\(prefix)    Selected Polar Pattern: \(selectedPolarPattern.rawValue)")
+                }
+                if let preferredPolarPattern = dataSource.preferredPolarPattern {
+                    print("\(prefix)    Preferred Polar Pattern: \(preferredPolarPattern.rawValue)")
+                }
+            }
+        } else {
+            print("\(prefix)Data Sources: None")
+        }
+        
+        print("\(prefix)---")
     }
     
     private func setupLocalAudio() {
@@ -238,7 +463,7 @@ class WebRTCManager: NSObject, ObservableObject {
             mandatoryConstraints: [
                 "googEchoCancellation": "true",
                 "googAutoGainControl": "true",
-                "googNoiseSuppression": "false",
+                "googNoiseSuppression": "true",
                 "googHighpassFilter": "true"
             ],
             optionalConstraints: nil
@@ -355,7 +580,9 @@ class WebRTCManager: NSObject, ObservableObject {
             }
             
         case "session.created":
-            print("Session created successfully")
+            if Config.DEBUG {
+                print("Session created successfully")
+            }
             
         case "error":
             // Handle error events from the API
@@ -365,11 +592,13 @@ class WebRTCManager: NSObject, ObservableObject {
                 let errorMessage = error["message"] as? String ?? "no message"
                 let errorParam = error["param"] as? String ?? "no param"
                 
-                print("❌ API Error:")
-                print("  Type: \(errorType)")
-                print("  Code: \(errorCode)")
-                print("  Message: \(errorMessage)")
-                print("  Param: \(errorParam)")
+                if Config.DEBUG {
+                    print("❌ API Error:")
+                    print("  Type: \(errorType)")
+                    print("  Code: \(errorCode)")
+                    print("  Message: \(errorMessage)")
+                    print("  Param: \(errorParam)")
+                }
                 
                 // Update connection status on main thread
                 DispatchQueue.main.async {
@@ -378,7 +607,9 @@ class WebRTCManager: NSObject, ObservableObject {
             }
             
         default:
-            print("Unhandled event type: \(eventType)")
+            if Config.DEBUG {
+                print("Unhandled event type: \(eventType)")
+            }
             break
         }
     }
@@ -387,12 +618,30 @@ class WebRTCManager: NSObject, ObservableObject {
 // MARK: - RTCPeerConnectionDelegate
 extension WebRTCManager: RTCPeerConnectionDelegate {
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCSignalingState) {}
-    func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {}
+    
+    func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {
+        if Config.DEBUG {
+            print("Remote stream added")
+        }
+        // Find and store remote audio track
+        for track in stream.audioTracks {
+            remoteAudioTrack = track
+            // Start in normal mode (remote audio disabled)
+            track.isEnabled = false
+            if Config.DEBUG {
+                print("Found remote audio track, initially disabled")
+            }
+            break
+        }
+    }
+    
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {}
     func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {}
     
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
-        print("ICE Connection State changed to: \(newState)")
+        if Config.DEBUG {
+            print("ICE Connection State changed to: \(newState)")
+        }
     }
     
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {}
@@ -408,7 +657,9 @@ extension WebRTCManager: RTCPeerConnectionDelegate {
 // MARK: - RTCDataChannelDelegate
 extension WebRTCManager: RTCDataChannelDelegate {
     func dataChannelDidChangeState(_ dataChannel: RTCDataChannel) {
-        print("Data channel state changed: \(dataChannel.readyState)")
+        if Config.DEBUG {
+            print("Data channel state changed: \(dataChannel.readyState)")
+        }
         // Auto-send session.update after channel is open
         if dataChannel.readyState == .open {
             sendSessionUpdate()
